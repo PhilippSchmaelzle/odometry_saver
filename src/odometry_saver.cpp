@@ -18,6 +18,9 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
 
 template<typename T>
 void save_data(const std::string& dst_directory, const T& data);
@@ -112,13 +115,18 @@ public:
     saved_odometry(0),
     points_save_queue(dst_directory),
     odometry_save_queue(dst_directory),
-    points_sub(nh.subscribe<sensor_msgs::PointCloud2>("/points", 128, &OdometrySaverNode::points_callback, this)),
-    odometry_sub(nh.subscribe<nav_msgs::Odometry>("/odom", 128, &OdometrySaverNode::odometry_callback, this)),
-    tf_listener(ros::DURATION_MAX)
+    //points_sub(nh.subscribe<sensor_msgs::PointCloud2>("/points", 128, &OdometrySaverNode::points_callback, this)),
+    //odometry_sub(nh.subscribe<nav_msgs::Odometry>("/odom", 128, &OdometrySaverNode::odometry_callback, this)),
+    tf_listener(ros::DURATION_MAX),
+    synchronizer_(SyncPolicy(10), sub_pointcloud_, sub_odom_)
   {
     boost::filesystem::create_directories(dst_directory);
 
     timer = nh.createWallTimer(ros::WallDuration(1.0), &OdometrySaverNode::timer_callback, this);
+
+    sub_pointcloud_.subscribe(nh, "/points", 128 ),
+    sub_odom_.subscribe(nh, "/odom", 128 ),
+    synchronizer_.registerCallback(&OdometrySaverNode::sync_callback, this);
   }
 
   ~OdometrySaverNode() {}
@@ -131,6 +139,40 @@ private:
     ROS_INFO_STREAM("queue points:" << points_save_queue.size() << "  odometry:" << odometry_save_queue.size());
     ROS_INFO_STREAM("saved points:" << saved_points << "  odometry:" << saved_odometry);
   }
+
+    void sync_callback( const sensor_msgs::PointCloud2Ptr& points_msg,
+                                                             const nav_msgs::OdometryConstPtr& odometry_msg ) {
+      saved_points++;
+      points_msg->header.stamp = odometry_msg->header.stamp;
+    points_save_queue.push(points_msg);
+
+    saved_odometry++;
+    Eigen::Matrix4d origin2odom = lookup_eigen(odometry_msg->header.frame_id, origin_frame);
+    Eigen::Matrix4d odom2base = lookup_eigen(endpoint_frame, odometry_msg->child_frame_id);
+
+    const auto& pose = odometry_msg->pose.pose;
+    Eigen::Matrix4d odombase2odom = Eigen::Matrix4d::Identity();
+    odombase2odom.block<3, 1>(0, 3) = Eigen::Vector3d(pose.position.x, pose.position.y, pose.position.z);
+    odombase2odom.block<3, 3>(0, 0) = Eigen::Quaterniond(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z).toRotationMatrix();
+
+    Eigen::Matrix4d result = odom2base * odombase2odom;// * origin2odom;
+    Eigen::Quaterniond quat(result.block<3, 3>(0, 0));
+
+    nav_msgs::OdometryPtr transformed(new nav_msgs::Odometry);
+    *transformed = *odometry_msg;
+
+    auto& dst_pose = transformed->pose.pose;
+    dst_pose.position.x = result(0, 3);
+    dst_pose.position.y = result(1, 3);
+    dst_pose.position.z = result(2, 3);
+
+    dst_pose.orientation.w = quat.w();
+    dst_pose.orientation.x = quat.x();
+    dst_pose.orientation.y = quat.y();
+    dst_pose.orientation.z = quat.z();
+
+    odometry_save_queue.push(transformed);
+}
 
   void points_callback(const sensor_msgs::PointCloud2ConstPtr& points_msg) {
     saved_points++;
@@ -198,6 +240,18 @@ private:
   ros::Subscriber odometry_sub;
 
   tf::TransformListener tf_listener;
+
+  // Subscribers for topics of multi modal object detection
+  message_filters::Subscriber<sensor_msgs::PointCloud2> sub_pointcloud_;
+  message_filters::Subscriber<nav_msgs::Odometry> sub_odom_;
+
+  // Synchronization of both object detection topics
+
+  using SyncPolicy = message_filters::sync_policies::ApproximateTime<
+          sensor_msgs::PointCloud2,
+          nav_msgs::Odometry>;
+  message_filters::Synchronizer<SyncPolicy> synchronizer_;
+
 };
 
 int main(int argc, char** argv) {
